@@ -1,11 +1,11 @@
 //! Getting the offered MIME types and the clipboard contents.
 
+use os_pipe::{pipe, PipeReader};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::io;
 use std::os::fd::AsFd;
-
-use os_pipe::{pipe, PipeReader};
+use std::sync::mpsc;
+use std::{io, thread};
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::WlSeat;
@@ -15,6 +15,7 @@ use wayland_client::{
 
 use crate::common::{self, initialize};
 use crate::data_control::{self, impl_dispatch_device, impl_dispatch_manager, impl_dispatch_offer};
+use crate::seat_data::SeatData;
 use crate::utils::is_text;
 
 /// The clipboard to operate on.
@@ -222,14 +223,7 @@ fn get_offer(
     }
 
     // Figure out which offer we're interested in.
-    let data = match seat {
-        Seat::Unspecified => state.common.seats.values().next(),
-        Seat::Specific(name) => state
-            .common
-            .seats
-            .values()
-            .find(|data| data.name.as_deref() == Some(name)),
-    };
+    let data = get_seat(&mut state, seat);
 
     let Some(data) = data else {
         return Err(Error::SeatNotFound);
@@ -340,26 +334,10 @@ pub(crate) fn get_contents_internal(
     let primary = clipboard == ClipboardType::Primary;
     let (mut queue, mut state, offer) = get_offer(primary, seat, socket_name)?;
 
-    let mut mime_types = state.offers.remove(&offer).unwrap();
+    let mime_types = state.offers.remove(&offer).unwrap();
 
     // Find the desired MIME type.
-    let mime_type = match mime_type {
-        MimeType::Any => mime_types
-            .take("text/plain;charset=utf-8")
-            .or_else(|| mime_types.take("UTF8_STRING"))
-            .or_else(|| mime_types.iter().find(|x| is_text(x)).cloned())
-            .or_else(|| mime_types.drain().next()),
-        MimeType::Text => mime_types
-            .take("text/plain;charset=utf-8")
-            .or_else(|| mime_types.take("UTF8_STRING"))
-            .or_else(|| mime_types.drain().find(|x| is_text(x))),
-        MimeType::TextWithPriority(priority) => mime_types
-            .take(priority)
-            .or_else(|| mime_types.take("text/plain;charset=utf-8"))
-            .or_else(|| mime_types.take("UTF8_STRING"))
-            .or_else(|| mime_types.drain().find(|x| is_text(x))),
-        MimeType::Specific(mime_type) => mime_types.take(mime_type),
-    };
+    let mime_type = check_mime_type(mime_types, mime_type);
 
     // Check if a suitable MIME type is copied.
     if mime_type.is_none() {
@@ -383,4 +361,125 @@ pub(crate) fn get_contents_internal(
         .map_err(Error::WaylandCommunication)?;
 
     Ok((read, mime_type))
+}
+
+/// Asynchronously sends clipboard contents through mpsc::channel.
+///
+/// This function returns a mpsc::Receiver containing the reading end of pipes containing the clipboard contents
+/// and the actual MIME type of the content.
+///
+/// If `seat` is `None`, uses an unspecified seat (it depends on the order returned by the
+/// compositor). This is perfectly fine when only a single seat is present, so for most
+/// configurations.
+///
+/// # Examples
+///
+/// ```no_run
+/// # extern crate wl_clipboard_rs;
+/// # fn foo() -> Result<(), Box<dyn std::error::Error>> {
+/// use std::io::Read;
+/// use wl_clipboard_rs::paste::{get_contents_channel , Error, MimeType, Seat};
+///
+/// let result = get_contents_channel(Seat::Unspecified, MimeType::Any);
+/// match result {
+///     Ok(rx) => {
+///         loop {
+///             if let Ok((mut pipe, mime_type)) = rx.recv() {
+///                 println!("Got data of the {} MIME type", &mime_type);
+///                 let mut contents = vec![];
+///                 pipe.read_to_end(&mut contents)?;
+///                 println!("Read {} bytes of data", contents.len());
+///             }
+///         }
+///     }
+///
+///     Err(Error::NoSeats) | Err(Error::ClipboardEmpty) | Err(Error::NoMimeType) => {
+///         // The clipboard is empty, nothing to worry about.
+///     }
+///
+///     Err(err) => Err(err)?
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[inline]
+pub fn get_contents_channel(
+    seat: Seat<'static>,
+    mime_type: MimeType<'static>,
+) -> Result<mpsc::Receiver<(PipeReader, String)>, Error> {
+    get_contents_channel_internal(seat, mime_type, None)
+}
+
+pub(crate) fn get_contents_channel_internal(
+    seat: Seat<'static>,
+    mime_type: MimeType<'static>,
+    socket_name: Option<OsString>,
+) -> Result<mpsc::Receiver<(PipeReader, String)>, Error> {
+    let (rs, tx) = mpsc::channel();
+    let (mut queue, mut state, _) = get_offer(false, seat, socket_name)?;
+    // drop first selections (only trigger on new)
+    state.offers.clear();
+    thread::spawn(move || {
+        loop {
+            match queue.blocking_dispatch(&mut state) {
+                Ok(_) => {
+                    // if seat not found, offer is not set, mime type list not found or mime type
+                    // doesn't pass, continue with the loop
+                    if let Some(seat) = get_seat(&mut state, seat) {
+                        if let Some(offer) = seat.offer.take() {
+                            if let Some(mime_types) = state.offers.remove(&offer) {
+                                if let Some(mime_type) = check_mime_type(mime_types, mime_type) {
+                                    let (read, write) = pipe().unwrap();
+                                    // Start the transfer.
+                                    offer.receive(mime_type.clone(), write.as_fd());
+                                    drop(write);
+
+                                    // A flush() is not enough here, it will result in sometimes pasting empty contents. I suspect this is due to a
+                                    // race between the compositor reacting to the receive request, and the compositor reacting to wl-paste
+                                    // disconnecting after queue is dropped. The roundtrip solves that race.
+                                    queue.roundtrip(&mut state).unwrap();
+                                    let _ = rs.send((read, mime_type));
+                                }
+                            }
+                        }
+                    };
+                }
+                Err(err) => {
+                    eprintln!("err:{err:?}");
+                }
+            }
+        }
+    });
+    Ok(tx)
+}
+
+fn get_seat<'a>(state: &'a mut State, seat: Seat) -> Option<&'a mut SeatData> {
+    match seat {
+        Seat::Unspecified => state.common.seats.values_mut().next(),
+        Seat::Specific(name) => state
+            .common
+            .seats
+            .values_mut()
+            .find(|data| data.name.as_deref() == Some(name)),
+    }
+}
+
+fn check_mime_type(mut mime_types: HashSet<String>, mime_type: MimeType) -> Option<String> {
+    match mime_type {
+        MimeType::Any => mime_types
+            .take("text/plain;charset=utf-8")
+            .or_else(|| mime_types.take("UTF8_STRING"))
+            .or_else(|| mime_types.iter().find(|x| is_text(x)).cloned())
+            .or_else(|| mime_types.drain().next()),
+        MimeType::Text => mime_types
+            .take("text/plain;charset=utf-8")
+            .or_else(|| mime_types.take("UTF8_STRING"))
+            .or_else(|| mime_types.drain().find(|x| is_text(x))),
+        MimeType::TextWithPriority(priority) => mime_types
+            .take(priority)
+            .or_else(|| mime_types.take("text/plain;charset=utf-8"))
+            .or_else(|| mime_types.take("UTF8_STRING"))
+            .or_else(|| mime_types.drain().find(|x| is_text(x))),
+        MimeType::Specific(mime_type) => mime_types.take(mime_type),
+    }
 }
