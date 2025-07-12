@@ -378,17 +378,24 @@ pub(crate) fn get_contents_internal(
 /// # extern crate wl_clipboard_rs;
 /// # fn foo() -> Result<(), Box<dyn std::error::Error>> {
 /// use std::io::Read;
-/// use wl_clipboard_rs::paste::{get_contents_channel , Error, MimeType, Seat};
+/// use wl_clipboard_rs::paste::{get_contents_channel, Error, MimeType, Seat};
 ///
 /// let result = get_contents_channel(Seat::Unspecified, MimeType::Any);
 /// match result {
 ///     Ok(rx) => {
 ///         loop {
-///             if let Ok((mut pipe, mime_type)) = rx.recv() {
-///                 println!("Got data of the {} MIME type", &mime_type);
-///                 let mut contents = vec![];
-///                 pipe.read_to_end(&mut contents)?;
-///                 println!("Read {} bytes of data", contents.len());
+///             match rx.recv() {
+///                 Ok(Ok((mut pipe, mime_type))) => {
+///                     println!("Got data of the {} MIME type", &mime_type);
+///                     let mut contents = vec![];
+///                     pipe.read_to_end(&mut contents)?;
+///                     println!("Read {} bytes of data", contents.len());
+///                 }
+///                 Ok(Err(Error::NoSeats)) | Ok(Err(Error::ClipboardEmpty)) | Ok(Err(Error::NoMimeType)) => {
+///                     // The clipboard is empty, nothing to worry about.
+///                 }
+///                 Ok(Err(err)) => Err(err)?, // other error getting clipboard data
+///                 Err(err) => Err(err)? // error receiving data
 ///             }
 ///         }
 ///     }
@@ -406,7 +413,7 @@ pub(crate) fn get_contents_internal(
 pub fn get_contents_channel(
     seat: Seat<'static>,
     mime_type: MimeType<'static>,
-) -> Result<mpsc::Receiver<(PipeReader, String)>, Error> {
+) -> Result<mpsc::Receiver<Result<(PipeReader, String), Error>>, Error> {
     get_contents_channel_internal(seat, mime_type, None)
 }
 
@@ -414,7 +421,7 @@ pub(crate) fn get_contents_channel_internal(
     seat: Seat<'static>,
     mime_type: MimeType<'static>,
     socket_name: Option<OsString>,
-) -> Result<mpsc::Receiver<(PipeReader, String)>, Error> {
+) -> Result<mpsc::Receiver<Result<(PipeReader, String), Error>>, Error> {
     let (rs, tx) = mpsc::channel();
     let (mut queue, mut state, _) = get_offer(false, seat, socket_name)?;
     // drop first selections (only trigger on new)
@@ -422,31 +429,47 @@ pub(crate) fn get_contents_channel_internal(
     thread::spawn(move || {
         loop {
             match queue.blocking_dispatch(&mut state) {
-                Ok(_) => {
-                    // if seat not found, offer is not set, mime type list not found or mime type
-                    // doesn't pass, continue with the loop
-                    if let Some(seat) = get_seat(&mut state, seat) {
+                Err(err) => {
+                    let _ = rs.send(Err(Error::WaylandCommunication(err)));
+                }
+                Ok(_) => match get_seat(&mut state, seat) {
+                    None => {
+                        let _ = rs.send(Err(Error::NoSeats));
+                    }
+                    Some(seat) => {
                         if let Some(offer) = seat.offer.take() {
                             if let Some(mime_types) = state.offers.remove(&offer) {
                                 if let Some(mime_type) = check_mime_type(mime_types, mime_type) {
-                                    let (read, write) = pipe().unwrap();
-                                    // Start the transfer.
-                                    offer.receive(mime_type.clone(), write.as_fd());
-                                    drop(write);
+                                    match pipe() {
+                                        Err(err) => {
+                                            let _ = rs.send(Err(Error::PipeCreation(err)));
+                                        }
+                                        Ok((read, write)) => {
+                                            // Start the transfer.
+                                            offer.receive(mime_type.clone(), write.as_fd());
+                                            drop(write);
 
-                                    // A flush() is not enough here, it will result in sometimes pasting empty contents. I suspect this is due to a
-                                    // race between the compositor reacting to the receive request, and the compositor reacting to wl-paste
-                                    // disconnecting after queue is dropped. The roundtrip solves that race.
-                                    queue.roundtrip(&mut state).unwrap();
-                                    let _ = rs.send((read, mime_type));
+                                            // A flush() is not enough here, it will result in sometimes pasting empty contents. I suspect this is due to a
+                                            // race between the compositor reacting to the receive request, and the compositor reacting to wl-paste
+                                            // disconnecting after queue is dropped. The roundtrip solves that race.
+                                            match queue.roundtrip(&mut state) {
+                                                Err(err) => {
+                                                    let _ = rs.send(Err(
+                                                        Error::WaylandCommunication(err),
+                                                    ));
+                                                }
+                                                Ok(_) => {
+                                                    // return the PipeReader
+                                                    let _ = rs.send(Ok((read, mime_type)));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    };
-                }
-                Err(err) => {
-                    eprintln!("err:{err:?}");
-                }
+                    }
+                },
             }
         }
     });
