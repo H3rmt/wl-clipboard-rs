@@ -422,58 +422,78 @@ pub(crate) fn get_contents_channel_internal(
     mime_type: MimeType<'static>,
     socket_name: Option<OsString>,
 ) -> Result<mpsc::Receiver<Result<(PipeReader, String), Error>>, Error> {
-    let (rs, tx) = mpsc::channel();
-    let (mut queue, mut state, _) = get_offer(false, seat, socket_name)?;
-    // drop first selections (only trigger on new)
-    state.offers.clear();
-    thread::spawn(move || {
-        loop {
-            match queue.blocking_dispatch(&mut state) {
-                Err(err) => {
-                    let _ = rs.send(Err(Error::WaylandCommunication(err)));
-                }
-                Ok(_) => match get_seat(&mut state, seat) {
-                    None => {
-                        let _ = rs.send(Err(Error::NoSeats));
-                    }
-                    Some(seat) => {
-                        if let Some(offer) = seat.offer.take() {
-                            if let Some(mime_types) = state.offers.remove(&offer) {
-                                if let Some(mime_type) = check_mime_type(mime_types, mime_type) {
-                                    match pipe() {
-                                        Err(err) => {
-                                            let _ = rs.send(Err(Error::PipeCreation(err)));
-                                        }
-                                        Ok((read, write)) => {
-                                            // Start the transfer.
-                                            offer.receive(mime_type.clone(), write.as_fd());
-                                            drop(write);
+    let (sender, receiver) = mpsc::channel();
+    let (queue, mut common) = initialize(false, socket_name)?;
+    for (seat, data) in &mut common.seats {
+        let device = common
+            .clipboard_manager
+            .get_data_device(seat, &queue.handle(), seat.clone());
+        data.set_device(Some(device));
+    }
+    let state = State {
+        common,
+        offers: HashMap::new(),
+        got_primary_selection: false,
+    };
+    thread::spawn(move || run_dispatch_loop(queue, state, seat, mime_type, sender));
+    Ok(receiver)
+}
 
-                                            // A flush() is not enough here, it will result in sometimes pasting empty contents. I suspect this is due to a
-                                            // race between the compositor reacting to the receive request, and the compositor reacting to wl-paste
-                                            // disconnecting after queue is dropped. The roundtrip solves that race.
-                                            match queue.roundtrip(&mut state) {
-                                                Err(err) => {
-                                                    let _ = rs.send(Err(
-                                                        Error::WaylandCommunication(err),
-                                                    ));
-                                                }
-                                                Ok(_) => {
-                                                    // return the PipeReader
-                                                    let _ = rs.send(Ok((read, mime_type)));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
+fn run_dispatch_loop(
+    mut queue: EventQueue<State>,
+    mut state: State,
+    seat: Seat<'static>,
+    mime_type: MimeType<'static>,
+    sender: mpsc::Sender<Result<(PipeReader, String), Error>>,
+) {
+    loop {
+        if let Err(err) = queue.blocking_dispatch(&mut state) {
+            if sender.send(Err(Error::WaylandCommunication(err))).is_err() {
+                return; // receiver closed
             }
+            continue;
         }
-    });
-    Ok(tx)
+
+        let Some(seat_data) = get_seat(&mut state, seat) else {
+            if sender.send(Err(Error::NoSeats)).is_err() {
+                return; // receiver closed
+            }
+            continue;
+        };
+
+        let Some(offer) = seat_data.offer.take() else {
+            continue;
+        };
+
+        let Some(mime_types) = state.offers.remove(&offer) else {
+            continue;
+        };
+
+        let Some(mime_type) = check_mime_type(mime_types, mime_type) else {
+            continue;
+        };
+
+        let Ok((read, write)) = pipe() else {
+            if sender.send(Err(Error::PipeCreation(io::Error::last_os_error()))).is_err() {
+                return; // receiver closed
+            }
+            continue;
+        };
+
+        offer.receive(mime_type.clone(), write.as_fd());
+        drop(write);
+
+        if let Err(err) = queue.roundtrip(&mut state) {
+            if sender.send(Err(Error::WaylandCommunication(err))).is_err() {
+                return; // receiver closed
+            }
+            continue;
+        }
+
+        if sender.send(Ok((read, mime_type))).is_err() {
+            return; // receiver closed
+        }
+    }
 }
 
 fn get_seat<'a>(state: &'a mut State, seat: Seat) -> Option<&'a mut SeatData> {
