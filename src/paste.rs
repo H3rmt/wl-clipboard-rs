@@ -461,20 +461,28 @@ fn run_dispatch_loop(
             continue;
         };
 
+        // should also not happen as new data should be put into offers
         let Some(offer) = seat_data.offer.take() else {
             continue;
         };
 
+        // shouldn't happen
         let Some(mime_types) = state.offers.remove(&offer) else {
             continue;
         };
 
         let Some(mime_type) = check_mime_type(mime_types, mime_type) else {
+            if sender.send(Err(Error::NoMimeType)).is_err() {
+                return; // receiver closed
+            }
             continue;
         };
 
         let Ok((read, write)) = pipe() else {
-            if sender.send(Err(Error::PipeCreation(io::Error::last_os_error()))).is_err() {
+            if sender
+                .send(Err(Error::PipeCreation(io::Error::last_os_error())))
+                .is_err()
+            {
                 return; // receiver closed
             }
             continue;

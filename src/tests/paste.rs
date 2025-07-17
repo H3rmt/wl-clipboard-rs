@@ -1,7 +1,6 @@
+use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-
-use proptest::prelude::*;
 use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1;
 
 use crate::paste::*;
@@ -308,6 +307,177 @@ fn get_contents_wrong_mime_type() {
         Some(socket_name),
     );
     assert!(matches!(result, Err(Error::NoMimeType)));
+}
+
+#[test]
+fn get_contents_channel_test() {
+    let server = TestServer::new();
+    server
+        .display
+        .handle()
+        .create_global::<State, ZwlrDataControlManagerV1, ()>(2, ());
+
+    let state = State {
+        seats: HashMap::from([(
+            "seat0".into(),
+            SeatInfo {
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    state.create_seats(&server);
+
+    let socket_name = server.socket_name().to_owned();
+    server.run(state);
+
+    let sources = vec![crate::copy::MimeSource {
+        source: crate::copy::Source::Bytes([1, 3, 3, 7, 8][..].into()),
+        mime_type: crate::copy::MimeType::Specific("application/octet-stream".into()),
+    }];
+    crate::copy::copy_internal(
+        crate::copy::Options::new(),
+        sources,
+        Some(socket_name.clone()),
+    )
+    .expect("unable to copy");
+
+    let tx =
+        get_contents_channel_internal(Seat::Unspecified, MimeType::Any, Some(socket_name.clone()))
+            .expect("unable to create channel");
+
+    let mut result = tx.recv().expect("failed to receive").expect("no data");
+    assert_eq!(result.1, "application/octet-stream");
+
+    let mut contents = vec![];
+    result.0.read_to_end(&mut contents).unwrap();
+    assert_eq!(contents, [1, 3, 3, 7, 8]);
+}
+
+#[test]
+fn get_contents_channel_no_protocol() {
+    let server = TestServer::new();
+
+    let state = State {
+        seats: HashMap::from([(
+            "seat0".into(),
+            SeatInfo {
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    state.create_seats(&server);
+
+    let socket_name = server.socket_name().to_owned();
+    server.run(state);
+
+    let result = get_contents_channel_internal(
+        Seat::Unspecified,
+        MimeType::Specific("wrong"),
+        Some(socket_name),
+    );
+    assert!(matches!(
+        result,
+        Err(Error::MissingProtocol {
+            name: "ext-data-control, or wlr-data-control",
+            version: 1
+        })
+    ));
+}
+
+#[test]
+fn get_contents_channel_wrong_mime_type() {
+    let server = TestServer::new();
+    server
+        .display
+        .handle()
+        .create_global::<State, ZwlrDataControlManagerV1, ()>(2, ());
+
+    let state = State {
+        seats: HashMap::from([(
+            "seat0".into(),
+            SeatInfo {
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    state.create_seats(&server);
+
+    let socket_name = server.socket_name().to_owned();
+    server.run(state);
+
+    let sources = vec![crate::copy::MimeSource {
+        source: crate::copy::Source::Bytes([1, 3, 3, 7, 8][..].into()),
+        mime_type: crate::copy::MimeType::Specific("application/octet-stream".into()),
+    }];
+    crate::copy::copy_internal(
+        crate::copy::Options::new(),
+        sources,
+        Some(socket_name.clone()),
+    )
+    .expect("unable to copy");
+
+    let tx = get_contents_channel_internal(
+        Seat::Unspecified,
+        MimeType::Specific("wrong"),
+        Some(socket_name),
+    )
+    .expect("unable to create channel");
+    let result = tx.recv().expect("failed to receive");
+    assert!(matches!(result, Err(Error::NoMimeType)));
+}
+
+#[test]
+fn get_contents_channel_test_multiple_mime() {
+    let server = TestServer::new();
+    server
+        .display
+        .handle()
+        .create_global::<State, ZwlrDataControlManagerV1, ()>(2, ());
+
+    let state = State {
+        seats: HashMap::from([(
+            "seat0".into(),
+            SeatInfo {
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    state.create_seats(&server);
+
+    let socket_name = server.socket_name().to_owned();
+    server.run(state);
+
+    let sources = vec![
+        crate::copy::MimeSource {
+            source: crate::copy::Source::Bytes([1, 3, 3, 7, 8][..].into()),
+            mime_type: crate::copy::MimeType::Specific("application/octet-stream".into()),
+        },
+        crate::copy::MimeSource {
+            source: crate::copy::Source::Bytes([1, 3, 3, 7, 9][..].into()),
+            mime_type: crate::copy::MimeType::Specific("STRING".into()),
+        },
+    ];
+    crate::copy::copy_internal(
+        crate::copy::Options::new(),
+        sources,
+        Some(socket_name.clone()),
+    )
+    .expect("unable to copy");
+
+    let tx =
+        get_contents_channel_internal(Seat::Unspecified, MimeType::Text, Some(socket_name.clone()))
+            .expect("unable to create channel");
+
+    let mut result = tx.recv().expect("failed to receive").expect("no data");
+    assert_eq!(result.1, "text/plain;charset=utf-8");
+
+    let mut contents = vec![];
+    result.0.read_to_end(&mut contents).unwrap();
+    assert_eq!(contents, [1, 3, 3, 7, 9]);
 }
 
 proptest! {
