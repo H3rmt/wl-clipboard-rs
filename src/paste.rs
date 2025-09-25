@@ -3,8 +3,10 @@
 use os_pipe::{pipe, PipeReader};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::Read;
 use std::os::fd::AsFd;
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::{io, thread};
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -14,7 +16,9 @@ use wayland_client::{
 };
 
 use crate::common::{self, initialize};
-use crate::data_control::{self, impl_dispatch_device, impl_dispatch_manager, impl_dispatch_offer};
+use crate::data_control::{
+    self, impl_dispatch_device, impl_dispatch_manager, impl_dispatch_offer, Offer,
+};
 use crate::seat_data::SeatData;
 use crate::utils::is_text;
 
@@ -71,7 +75,7 @@ struct State {
     common: common::State,
     // The value is the set of MIME types in the offer.
     // TODO: We never remove offers from here, even if we don't use them or after destroying them.
-    offers: HashMap<data_control::Offer, HashSet<String>>,
+    offers: HashMap<Offer, HashSet<String>>,
     got_primary_selection: bool,
 }
 
@@ -400,8 +404,8 @@ pub(crate) fn get_contents_internal(
 ///         }
 ///     }
 ///
-///     Err(Error::NoSeats) | Err(Error::ClipboardEmpty) | Err(Error::NoMimeType) => {
-///         // The clipboard is empty, nothing to worry about.
+///     Err(Error::WaylandConnection) | Err(Error::WaylandCommunication) | Err(Error::MissingProtocol) => {
+///         // Error setting up channel
 ///     }
 ///
 ///     Err(err) => Err(err)?
@@ -501,6 +505,144 @@ fn run_dispatch_loop(
         if sender.send(Ok((read, mime_type))).is_err() {
             return; // receiver closed
         }
+    }
+}
+
+/// Asynchronously handle all clipboard contents with a callback.
+///
+/// This function returns a JoinHandle to the background thread and accepts a callback that either receives an Ok variant containing a HashMap of all offered MIME types
+/// and a function to load the contents of a specific MIME type or Error if something went wrong.
+/// If the function returns true, the thread will exit.
+///
+/// If `seat` is `None`, uses an unspecified seat (it depends on the order returned by the
+/// compositor). This is perfectly fine when only a single seat is present, so for most
+/// configurations.
+///
+/// # Examples
+///
+/// ```no_run
+/// # extern crate wl_clipboard_rs;
+/// use wl_clipboard_rs::paste::get_all_contents_channel;
+///
+/// fn handle_values(
+///     data: wl_clipboard_rs::paste::Data
+/// ) -> bool {
+///   let Ok((mut mimes, mut load)) = data else {
+///     return false;
+///   };
+///   if mimes.contains("text/html") {
+///     let data = load("text/html".to_string()).unwrap();
+///     println!("Got HTML data: {}", String::from_utf8_lossy(&data));
+///   }
+///   false
+/// }
+///
+/// fn foo() -> Result<(), Box<dyn std::error::Error>> {
+///   let result = get_all_contents_channel(Seat::Unspecified, Box::new(filter_mime));
+///   match result {
+///     Ok(handle) => {
+///         handle.join()
+///     }
+///     Err(Error::WaylandConnection) | Err(Error::WaylandCommunication) | Err(Error::MissingProtocol) => {
+///         // Error setting up listener
+///     }
+///     Err(err) => Err(err)?
+///   }
+///   Ok(())
+/// }
+/// ```
+#[inline]
+pub fn get_all_contents_callback(
+    seat: Seat<'static>,
+    callback: Box<dyn Fn(Data) -> bool + Send + Sync + 'static>,
+) -> Result<JoinHandle<()>, Error> {
+    get_all_contents_callback_internal(seat, callback, None)
+}
+
+pub type Data<'a> = Result<
+    (
+        HashSet<String>,
+        &'a mut (dyn FnMut(String) -> Result<Vec<u8>, Error> + Send),
+    ),
+    Error,
+>;
+
+pub(crate) fn get_all_contents_callback_internal(
+    seat: Seat<'static>,
+    callback: Box<dyn Fn(Data) -> bool + Send + Sync + 'static>,
+    socket_name: Option<OsString>,
+) -> Result<JoinHandle<()>, Error> {
+    let (queue, mut common) = initialize(false, socket_name)?;
+    for (seat, data) in &mut common.seats {
+        let device = common
+            .clipboard_manager
+            .get_data_device(seat, &queue.handle(), seat.clone());
+        data.set_device(Some(device));
+    }
+    let state = State {
+        common,
+        offers: HashMap::new(),
+        got_primary_selection: false,
+    };
+    let handle = thread::spawn(move || run_callback_dispatch_loop(queue, state, seat, callback));
+    Ok(handle)
+}
+
+fn run_callback_dispatch_loop(
+    mut queue: EventQueue<State>,
+    mut state: State,
+    seat: Seat<'static>,
+    callback: Box<dyn Fn(Data) -> bool + Send + Sync + 'static>,
+) {
+    loop {
+        if let Err(err) = queue.blocking_dispatch(&mut state) {
+            if callback(Err(Error::WaylandCommunication(err))) {
+                return;
+            }
+            continue;
+        }
+
+        let Some(seat_data) = get_seat(&mut state, seat) else {
+            if callback(Err(Error::NoSeats)) {
+                return;
+            }
+            continue;
+        };
+
+        // should also not happen as new data should be put into offers
+        let Some(offer) = seat_data.offer.take() else {
+            continue;
+        };
+
+        // shouldn't happen
+        let Some(mime_types) = state.offers.remove(&offer) else {
+            continue;
+        };
+
+        {
+            let mut load = create_load_mime_fn(offer.clone(), &mut queue, &mut state);
+            if callback(Ok((mime_types, &mut load))) {
+                return;
+            }
+        }
+    }
+}
+
+fn create_load_mime_fn<'a>(
+    offer: Offer,
+    queue: &'a mut EventQueue<State>,
+    state: &'a mut State,
+) -> impl FnMut(String) -> Result<Vec<u8>, Error> + use<'a> {
+    move |mime: String| {
+        let Ok((mut read, write)) = pipe() else {
+            return Err(Error::PipeCreation(io::Error::last_os_error()));
+        };
+        offer.receive(mime.clone(), write.as_fd());
+        drop(write);
+        let mut contents = Vec::new();
+        let _ = queue.roundtrip(state);
+        let _ = read.read_to_end(&mut contents);
+        Ok(contents)
     }
 }
 
